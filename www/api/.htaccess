@@ -1,0 +1,5 @@
+Options -Indexes -MultiViews
+
+RewriteEngine On
+RewriteRule ^interpreter$ overpass_proxy.php [L,QSA]
+RewriteRule ^interpreter/$ overpass_proxy.php [L,QSA]
