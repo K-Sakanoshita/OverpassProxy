@@ -85,29 +85,35 @@ function getBasicAuthCredentials(): array
             margin: 0;
             padding: 0;
             height: 100%;
+            overflow: hidden;
             font-family: sans-serif;
         }
 
         #app {
             display: grid;
-            grid-template-columns: 1.4fr 1fr;
-            height: 100%;
+            grid-template-columns: minmax(0, 1.4fr) minmax(320px, 1fr);
+            height: 100vh;
+            min-height: 0;
+            overflow: hidden;
         }
 
         #map {
-            height: 100%;
-            min-height: 400px;
+            height: 100vh;
+            min-height: 0;
         }
 
         #side {
             display: flex;
             flex-direction: column;
             min-width: 320px;
+            min-height: 0;
+            overflow: hidden;
             border-left: 1px solid #ccc;
             background: #fff;
         }
 
         .controls {
+            flex: 0 0 auto;
             padding: 12px;
             border-bottom: 1px solid #ddd;
             display: grid;
@@ -128,14 +134,25 @@ function getBasicAuthCredentials(): array
 
         .summary,
         .selection {
+            flex: 0 0 auto;
             padding: 12px;
             border-bottom: 1px solid #ddd;
             font-size: 14px;
         }
 
+        .selection {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            align-items: center;
+            justify-content: space-between;
+        }
+
         #list {
-            flex: 1;
-            overflow: auto;
+            flex: 1 1 auto;
+            min-height: 0;
+            overflow-y: auto;
+            overflow-x: auto;
         }
 
         table {
@@ -150,6 +167,13 @@ function getBasicAuthCredentials(): array
             padding: 6px 8px;
             text-align: left;
             vertical-align: top;
+        }
+
+        thead th {
+            position: sticky;
+            top: 0;
+            z-index: 1;
+            background: #fff;
         }
 
         tr.selected {
@@ -185,6 +209,23 @@ function getBasicAuthCredentials(): array
             color: #666;
             font-size: 12px;
         }
+
+        .download-link {
+            display: inline-block;
+            padding: 6px 10px;
+            border: 1px solid #1971c2;
+            border-radius: 4px;
+            color: #1971c2;
+            text-decoration: none;
+            white-space: nowrap;
+        }
+
+        .download-link.disabled {
+            border-color: #bbb;
+            color: #999;
+            pointer-events: none;
+            cursor: default;
+        }
     </style>
 </head>
 
@@ -209,13 +250,20 @@ function getBasicAuthCredentials(): array
                     <button id="btnDeleteSelected">選択削除</button>
                     <button id="btnDeleteExpired">期限切れ削除</button>
                 </div>
+                <div class="row">
+                    <label>作成から <input type="number" id="deleteOlderThanDays" min="1" max="3650" value="7" style="width:80px"> 日より古い</label>
+                    <button id="btnDeleteOlderThanDays">指定日数より古いキャッシュ削除</button>
+                </div>
                 <div class="notice">
-                    地図上の矩形をクリックで選択。範囲選択モード中はドラッグで一括選択。
+                    地図上の矩形をクリックで選択。範囲選択モード中はドラッグで一括選択。日数指定削除は「created_at」が基準です。
                 </div>
             </div>
 
             <div class="summary" id="summary">集計を読込中...</div>
-            <div class="selection" id="selectionInfo">選択 0 件</div>
+            <div class="selection">
+                <span id="selectionInfo">選択 0 件</span>
+                <a id="downloadSelected" class="download-link disabled" href="#" download aria-disabled="true">選択キャッシュをダウンロード</a>
+            </div>
 
             <div id="list">
                 <table>
@@ -258,6 +306,9 @@ function getBasicAuthCredentials(): array
         const btnClearSelection = document.getElementById('btnClearSelection');
         const btnDeleteSelected = document.getElementById('btnDeleteSelected');
         const btnDeleteExpired = document.getElementById('btnDeleteExpired');
+        const btnDeleteOlderThanDays = document.getElementById('btnDeleteOlderThanDays');
+        const deleteOlderThanDaysInput = document.getElementById('deleteOlderThanDays');
+        const downloadSelected = document.getElementById('downloadSelected');
         const includeExpired = document.getElementById('includeExpired');
         const limitInput = document.getElementById('limit');
         const summaryEl = document.getElementById('summary');
@@ -270,6 +321,8 @@ function getBasicAuthCredentials(): array
         btnClearSelection.addEventListener('click', clearSelection);
         btnDeleteSelected.addEventListener('click', deleteSelected);
         btnDeleteExpired.addEventListener('click', deleteExpired);
+        btnDeleteOlderThanDays.addEventListener('click', deleteOlderThanDays);
+        downloadSelected.addEventListener('click', onDownloadSelectedClick);
 
         map.on('mousedown', onMapMouseDown);
         map.on('mousemove', onMapMouseMove);
@@ -279,20 +332,21 @@ function getBasicAuthCredentials(): array
         loadCaches(true);
 
         async function loadSummary() {
-            const res = await fetch(apiUrl + '?action=summary', {
-                credentials: 'same-origin'
-            });
-            const data = await res.json();
-            if (!data.ok) return;
+            try {
+                const data = await fetchJson(apiUrl + '?action=summary', {
+                    credentials: 'same-origin'
+                });
 
-            const s = data.summary;
-            summaryEl.innerHTML =
-                `総数 ${s.total_count} 件 / 有効 ${s.active_count} 件 / 期限切れ ${s.expired_count} 件 / 保存サイズ ${formatBytes(s.total_bytes)}`;
+                const s = data.summary;
+                summaryEl.innerHTML =
+                    `総数 ${s.total_count} 件 / 有効 ${s.active_count} 件 / 期限切れ ${s.expired_count} 件 / 保存サイズ ${formatBytes(s.total_bytes)}`;
+            } catch (err) {
+                console.error(err);
+                summaryEl.textContent = '集計読込失敗: ' + getErrorMessage(err);
+            }
         }
 
         async function loadCaches(visibleOnly) {
-            clearMap();
-
             const params = new URLSearchParams();
             params.set('action', 'list');
             params.set('limit', String(Math.max(1, Math.min(2000, Number(limitInput.value) || 500))));
@@ -306,33 +360,34 @@ function getBasicAuthCredentials(): array
                 params.set('east', String(b.getEast()));
             }
 
-            const res = await fetch(apiUrl + '?' + params.toString(), {
-                credentials: 'same-origin'
-            });
-            const data = await res.json();
-
-            if (!data.ok) {
-                alert(data.error || '読込失敗');
-                return;
-            }
-
-            loadedItems = data.items;
-            renderItems(loadedItems);
-
-            if (!visibleOnly && loadedItems.length > 0) {
-                const fg = [];
-                for (const item of loadedItems) {
-                    fg.push([
-                        [item.south, item.west],
-                        [item.north, item.east]
-                    ]);
-                }
-                map.fitBounds(fg[0], {
-                    padding: [20, 20]
+            try {
+                const data = await fetchJson(apiUrl + '?' + params.toString(), {
+                    credentials: 'same-origin'
                 });
-            }
 
-            loadSummary();
+                clearMap();
+                loadedItems = data.items;
+                renderItems(loadedItems);
+
+                if (!visibleOnly && loadedItems.length > 0) {
+                    const boundsList = [];
+                    for (const item of loadedItems) {
+                        boundsList.push([
+                            [item.south, item.west],
+                            [item.north, item.east]
+                        ]);
+                    }
+                    const allBounds = L.latLngBounds(boundsList.flat());
+                    map.fitBounds(allBounds, {
+                        padding: [20, 20]
+                    });
+                }
+
+                await loadSummary();
+            } catch (err) {
+                console.error(err);
+                alert('読込失敗: ' + getErrorMessage(err));
+            }
         }
 
         function clearMap() {
@@ -455,6 +510,31 @@ function getBasicAuthCredentials(): array
 
         function updateSelectionInfo() {
             selectionInfoEl.textContent = `選択 ${selectedKeys.size} 件`;
+
+            const hasSelection = selectedKeys.size > 0;
+            downloadSelected.classList.toggle('disabled', !hasSelection);
+            downloadSelected.setAttribute('aria-disabled', hasSelection ? 'false' : 'true');
+            downloadSelected.href = hasSelection ? buildDownloadSelectedUrl() : '#';
+        }
+
+        function buildDownloadSelectedUrl() {
+            const params = new URLSearchParams();
+            params.set('action', 'download');
+            params.set('keys', [...selectedKeys].join(','));
+            return apiUrl + '?' + params.toString();
+        }
+
+        function onDownloadSelectedClick(e) {
+            if (selectedKeys.size === 0) {
+                e.preventDefault();
+                alert('選択がありません');
+                return;
+            }
+
+            if (selectedKeys.size > 100) {
+                e.preventDefault();
+                alert('一度にダウンロードできるのは100件までです。件数を減らしてください。');
+            }
         }
 
         function toggleSelectionMode() {
@@ -523,25 +603,25 @@ function getBasicAuthCredentials(): array
                 return;
             }
 
-            const res = await fetch(apiUrl, {
-                method: 'POST',
-                credentials: 'same-origin',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    action: 'delete',
-                    keys: [...selectedKeys]
-                })
-            });
+            try {
+                const data = await fetchJson(apiUrl, {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        action: 'delete',
+                        keys: [...selectedKeys]
+                    })
+                });
 
-            const data = await res.json();
-            if (!data.ok) {
-                alert(data.error || '削除失敗');
-                return;
+                alert(`${data.deleted ?? 0} 件を削除しました。`);
+                await loadCaches(true);
+            } catch (err) {
+                console.error(err);
+                alert('削除失敗: ' + getErrorMessage(err));
             }
-
-            await loadCaches(true);
         }
 
         async function deleteExpired() {
@@ -549,24 +629,86 @@ function getBasicAuthCredentials(): array
                 return;
             }
 
-            const res = await fetch(apiUrl, {
-                method: 'POST',
-                credentials: 'same-origin',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    action: 'delete_expired'
-                })
-            });
+            try {
+                const data = await fetchJson(apiUrl, {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        action: 'delete_expired'
+                    })
+                });
 
-            const data = await res.json();
-            if (!data.ok) {
-                alert(data.error || '削除失敗');
+                alert(`${data.deleted ?? 0} 件を削除しました。`);
+                await loadCaches(true);
+            } catch (err) {
+                console.error(err);
+                alert('削除失敗: ' + getErrorMessage(err));
+            }
+        }
+
+        async function deleteOlderThanDays() {
+            const days = Math.trunc(Number(deleteOlderThanDaysInput.value));
+
+            if (!Number.isFinite(days) || days < 1 || days > 3650) {
+                alert('日数は 1〜3650 の整数で指定してください。');
                 return;
             }
 
-            await loadCaches(true);
+            if (!confirm(`作成日時が ${days} 日より古いキャッシュを削除します。\nこの操作は元に戻せません。`)) {
+                return;
+            }
+
+            try {
+                const data = await fetchJson(apiUrl, {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        action: 'delete_older_than_days',
+                        days
+                    })
+                });
+
+                alert(`${data.deleted ?? 0} 件を削除しました。`);
+                await loadCaches(true);
+            } catch (err) {
+                console.error(err);
+                alert('削除失敗: ' + getErrorMessage(err));
+            }
+        }
+
+        async function fetchJson(url, options = {}) {
+            const res = await fetch(url, options);
+            const text = await res.text();
+            const trimmed = text.trim();
+
+            if (trimmed === '') {
+                throw new Error(`APIから空の応答が返りました。HTTP ${res.status} ${res.statusText}`);
+            }
+
+            let data;
+            try {
+                data = JSON.parse(trimmed);
+            } catch (err) {
+                const preview = trimmed.slice(0, 600);
+                throw new Error(`API応答がJSONではありません。HTTP ${res.status} ${res.statusText}
+${preview}`);
+            }
+
+            if (!res.ok || !data.ok) {
+                throw new Error(data.error || `APIエラーです。HTTP ${res.status} ${res.statusText}`);
+            }
+
+            return data;
+        }
+
+        function getErrorMessage(err) {
+            return err instanceof Error ? err.message : String(err);
         }
 
         function formatBytes(bytes) {

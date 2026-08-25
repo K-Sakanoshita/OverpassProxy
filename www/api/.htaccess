@@ -1,5 +1,21 @@
 Options -Indexes -MultiViews
 
+<IfModule mod_deflate.c>
+    AddOutputFilterByType DEFLATE application/json application/javascript application/xml
+    AddOutputFilterByType DEFLATE text/css text/html text/javascript text/plain text/xml
+</IfModule>
+
 RewriteEngine On
 RewriteRule ^interpreter$ overpass_proxy.php [L,QSA]
 RewriteRule ^interpreter/$ overpass_proxy.php [L,QSA]
+
+# 旧実装の保管コピーは公開エンドポイントとして実行させない。
+<Files "overpass_proxy_org.php">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</Files>
