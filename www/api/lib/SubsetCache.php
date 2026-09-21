@@ -5,9 +5,9 @@ declare(strict_types=1);
 /**
  * Conservative subset extraction for cached Overpass JSON responses.
  *
- * Phase 1 supports node/way responses only. A response containing relations or
- * unsupported element shapes is rejected so the caller can fall back to the
- * normal upstream request.
+ * Nodes and ways are spatially reduced, while relations are deliberately kept
+ * intact. Dependencies referenced by cached relations are kept when they are
+ * present in the same cached response.
  */
 final class ProxySubsetCache
 {
@@ -17,7 +17,8 @@ final class ProxySubsetCache
      *   body: string,
      *   source_elements: int,
      *   returned_elements: int,
-     *   selected_ways: int
+     *   selected_ways: int,
+     *   selected_relations: int
      * }|null
      */
     public static function extract(string $sourceBody, array $requestedBBox): ?array
@@ -39,24 +40,23 @@ final class ProxySubsetCache
 
         $elements = $document['elements'];
         $nodesById = [];
+        $waysById = [];
+        $relationsById = [];
 
         foreach ($elements as $index => $element) {
-            if (!is_array($element) || !isset($element['type'])) {
+            if (!is_array($element) || !isset($element['type'], $element['id'])) {
                 return null;
             }
 
             $type = (string)$element['type'];
-            if ($type === 'relation') {
-                // Phase 2: relation/member dependency closure.
-                return null;
-            }
+            $id = (string)$element['id'];
 
             if ($type === 'node') {
-                if (!isset($element['id']) || !self::hasCoordinate($element)) {
+                if (!self::hasCoordinate($element)) {
                     return null;
                 }
 
-                $nodesById[(string)$element['id']] = [
+                $nodesById[$id] = [
                     'index' => $index,
                     'lat' => (float)$element['lat'],
                     'lon' => (float)$element['lon'],
@@ -64,31 +64,108 @@ final class ProxySubsetCache
                 continue;
             }
 
-            if ($type !== 'way') {
-                // area / derived elements / unsupported result shapes must fall back.
-                return null;
+            if ($type === 'way') {
+                $waysById[$id] = ['index' => $index];
+                continue;
             }
+
+            if ($type === 'relation') {
+                if (isset($element['members']) && !is_array($element['members'])) {
+                    return null;
+                }
+
+                $relationsById[$id] = ['index' => $index];
+                continue;
+            }
+
+            // area / derived elements / unsupported result shapes must fall back.
+            return null;
         }
 
         $keep = [];
 
-        // Preserve nodes that are spatially inside the requested bbox. Some may be
-        // root query results; dependency nodes for selected ways are added below.
+        // Preserve nodes spatially inside the requested bbox. Way/relation
+        // dependencies outside the bbox are added below.
         foreach ($nodesById as $node) {
             if (self::pointInBBox($node['lat'], $node['lon'], $requestedBBox)) {
                 $keep[$node['index']] = true;
             }
         }
 
-        $selectedWays = 0;
+        // Relations are intentionally not spatially subsetted. Keep every
+        // relation in the cached response, then preserve all dependencies that
+        // are also present in that response. A queue + visited set handles
+        // relation -> relation references and cycles safely.
+        $relationQueue = array_keys($relationsById);
+        $visitedRelations = [];
+        $cursor = 0;
+
+        while ($cursor < count($relationQueue)) {
+            $relationId = (string)$relationQueue[$cursor++];
+            if (isset($visitedRelations[$relationId])) {
+                continue;
+            }
+            $visitedRelations[$relationId] = true;
+
+            if (!isset($relationsById[$relationId])) {
+                continue;
+            }
+
+            $relationIndex = $relationsById[$relationId]['index'];
+            $keep[$relationIndex] = true;
+            $relation = $elements[$relationIndex];
+            $members = $relation['members'] ?? [];
+
+            foreach ($members as $member) {
+                if (!is_array($member) || !isset($member['type'], $member['ref'])) {
+                    return null;
+                }
+
+                $memberType = (string)$member['type'];
+                $memberId = (string)$member['ref'];
+
+                if ($memberType === 'node') {
+                    if (isset($nodesById[$memberId])) {
+                        $keep[$nodesById[$memberId]['index']] = true;
+                    }
+                    continue;
+                }
+
+                if ($memberType === 'way') {
+                    if (isset($waysById[$memberId])) {
+                        $wayIndex = $waysById[$memberId]['index'];
+                        $keep[$wayIndex] = true;
+                        self::keepWayNodes($elements[$wayIndex], $nodesById, $keep);
+                    }
+                    continue;
+                }
+
+                if ($memberType === 'relation') {
+                    if (isset($relationsById[$memberId]) && !isset($visitedRelations[$memberId])) {
+                        $relationQueue[] = $memberId;
+                    }
+                    continue;
+                }
+
+                return null;
+            }
+        }
+
+        // For ways not already retained as relation dependencies, use a
+        // conservative bbox intersection test. The way itself is never clipped.
         foreach ($elements as $index => $element) {
             if (!is_array($element) || ($element['type'] ?? null) !== 'way') {
                 continue;
             }
 
+            if (isset($keep[$index])) {
+                continue;
+            }
+
             $wayBBox = self::wayBBox($element, $nodesById);
             if ($wayBBox === null) {
-                // We cannot safely decide whether the way intersects the request.
+                // We cannot safely decide whether this independent way intersects
+                // the request, so let the caller fall back to the upstream path.
                 return null;
             }
 
@@ -96,26 +173,24 @@ final class ProxySubsetCache
                 continue;
             }
 
-            // Keep the complete way object; never clip its geometry at the bbox.
             $keep[$index] = true;
-            $selectedWays++;
-
-            // Keep every referenced node that is available in this cached response,
-            // even when the node itself lies outside requestedBBox.
-            if (isset($element['nodes']) && is_array($element['nodes'])) {
-                foreach ($element['nodes'] as $nodeId) {
-                    $key = (string)$nodeId;
-                    if (isset($nodesById[$key])) {
-                        $keep[$nodesById[$key]['index']] = true;
-                    }
-                }
-            }
+            self::keepWayNodes($element, $nodesById, $keep);
         }
 
         $filtered = [];
+        $selectedWays = 0;
+        $selectedRelations = 0;
+
         foreach ($elements as $index => $element) {
-            if (isset($keep[$index])) {
-                $filtered[] = $element;
+            if (!isset($keep[$index])) {
+                continue;
+            }
+
+            $filtered[] = $element;
+            if (($element['type'] ?? null) === 'way') {
+                $selectedWays++;
+            } elseif (($element['type'] ?? null) === 'relation') {
+                $selectedRelations++;
             }
         }
 
@@ -135,7 +210,26 @@ final class ProxySubsetCache
             'source_elements' => count($elements),
             'returned_elements' => count($filtered),
             'selected_ways' => $selectedWays,
+            'selected_relations' => $selectedRelations,
         ];
+    }
+
+    /**
+     * @param array<string, array{index: int|string, lat: float, lon: float}> $nodesById
+     * @param array<int|string, bool> $keep
+     */
+    private static function keepWayNodes(array $way, array $nodesById, array &$keep): void
+    {
+        if (!isset($way['nodes']) || !is_array($way['nodes'])) {
+            return;
+        }
+
+        foreach ($way['nodes'] as $nodeId) {
+            $key = (string)$nodeId;
+            if (isset($nodesById[$key])) {
+                $keep[$nodesById[$key]['index']] = true;
+            }
+        }
     }
 
     private static function hasCoordinate(array $node): bool
