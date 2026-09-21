@@ -238,6 +238,7 @@ try {
             header('X-Cache-Subset-Source-Elements: ' . (string)$cached['subset_source_elements']);
             header('X-Cache-Subset-Returned-Elements: ' . (string)$cached['subset_returned_elements']);
             header('X-Cache-Subset-Selected-Ways: ' . (string)$cached['subset_selected_ways']);
+            header('X-Cache-Subset-Selected-Relations: ' . (string)$cached['subset_selected_relations']);
         }
         header('X-Normalization-Mode: ' . $normalizationMode);
         header('X-Upstream-Route: ' . $route['name']);
@@ -827,7 +828,8 @@ function bboxContains(array $outer, array $inner): bool
  *   normalized_bbox: string,
  *   subset_source_elements?: int,
  *   subset_returned_elements?: int,
- *   subset_selected_ways?: int
+ *   subset_selected_ways?: int,
+ *   subset_selected_relations?: int
  * }|null
  */
 function findCache(
@@ -862,6 +864,7 @@ function findCache(
                 $candidate['subset_source_elements'] = $subset['source_elements'];
                 $candidate['subset_returned_elements'] = $subset['returned_elements'];
                 $candidate['subset_selected_ways'] = $subset['selected_ways'];
+                $candidate['subset_selected_relations'] = $subset['selected_relations'];
                 return $candidate;
             }
         }
