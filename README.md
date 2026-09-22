@@ -53,7 +53,19 @@ Overpass API互換のPHPプロキシです。bboxに応じて上流を選択し�
 
 `raw_bbox_grid_enabled=false` にすると、bboxを抽出できるrawクエリも従来の完全passthroughへ戻ります。ポリシーを変更するときは `raw_bbox_grid_policy_version` も変更すると、異なる正規化方式のキャッシュ混在を防げます。
 
-キャッシュ検索は全モードで完全一致を優先します。さらに広いbboxのキャッシュを流用する包含検索は、`allow_containing_cache_match=false` により既定で無効です。
+キャッシュ検索は全モードで完全一致を優先します。完全一致しない場合は、`subset_cache_enabled`（未指定時は有効）により、要求bboxを包含する既存キャッシュからnode/wayを保守的に切り出し、relationはキャッシュ内のものを保持して再利用します。
+
+subset cache Phase 1 は次の方針です。
+
+- nodeは要求bbox内のものを残します。
+- wayは、way全体のbboxが要求bboxと少しでも交差すればwayオブジェクトを丸ごと残します。geometry自体はclipしません。
+- 採用したwayが参照するnodeは要求bbox外でも残します。
+- `out body;>;out skel;` のようにwayのnode参照とnode座標が揃うレスポンスにも対応します。
+- relationは空間的に切り出さず、キャッシュ内にあるrelationをすべて保持します。relationが参照するway/node/relationも、同じキャッシュ内に存在する限り保持します。relation→relationの循環参照はvisited管理で安全に処理します。
+- relation依存ではないwayで、範囲判定に必要なnode座標が不足する場合や、未知のelement形式が含まれる場合はsubset化せず通常のMISS処理へ戻ります。
+- subset HIT時は `X-Cache-Match: subset`、`X-Requested-BBox`、要素数・Way数・Relation数の診断ヘッダーを返します。
+
+旧来の「より大きなbboxのキャッシュ本文をそのまま返す」包含検索は、`allow_containing_cache_match=false` により既定で無効です。
 
 キャッシュキー形式はグリッドポリシーを含むv7へ更新されています。導入直後は新しいキーに対してコールドキャッシュになります。旧形式のキャッシュはヒットしませんが、通常の期限切れ削除で除去されます。すぐにDB容量を回収したい場合だけ、管理画面から旧キャッシュを削除してください。
 

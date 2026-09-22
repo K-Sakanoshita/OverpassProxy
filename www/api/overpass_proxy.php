@@ -49,6 +49,7 @@ $supportPaths = [
     __DIR__ . '/lib/RequestGuard.php',
     __DIR__ . '/lib/BboxGrid.php',
     __DIR__ . '/lib/RawQueryBbox.php',
+    __DIR__ . '/lib/SubsetCache.php',
 ];
 foreach ($supportPaths as $supportPath) {
     if (!is_file($supportPath)) {
@@ -216,7 +217,9 @@ try {
             $cacheKey,
             $queryHash,
             $normalizedBBox,
-            (bool)($config['allow_containing_cache_match'] ?? false)
+            (bool)($config['allow_containing_cache_match'] ?? false),
+            $bbox,
+            (bool)($config['subset_cache_enabled'] ?? true)
         );
     } catch (PDOException $e) {
         error_log('Overpass proxy cache DB unavailable: ' . $e->getMessage());
@@ -227,9 +230,16 @@ try {
 
     if ($cached !== null) {
         header('X-Cache-Status: HIT');
-        header('X-Cache-Match: ' . $cached['match_type']); // exact | contains
+        header('X-Cache-Match: ' . $cached['match_type']); // exact | subset | contains
         header('X-Normalized-BBox: ' . $normalizedBBoxText);
         header('X-Cache-Source-BBox: ' . $cached['normalized_bbox']);
+        if ($cached['match_type'] === 'subset') {
+            header('X-Requested-BBox: ' . bboxToString($bbox));
+            header('X-Cache-Subset-Source-Elements: ' . (string)$cached['subset_source_elements']);
+            header('X-Cache-Subset-Returned-Elements: ' . (string)$cached['subset_returned_elements']);
+            header('X-Cache-Subset-Selected-Ways: ' . (string)$cached['subset_selected_ways']);
+            header('X-Cache-Subset-Selected-Relations: ' . (string)$cached['subset_selected_relations']);
+        }
         header('X-Normalization-Mode: ' . $normalizationMode);
         header('X-Upstream-Route: ' . $route['name']);
         header('X-Upstream-Reason: ' . $route['reason']);
@@ -808,21 +818,28 @@ function bboxContains(array $outer, array $inner): bool
 }
 
 /**
- * @param array{0: float, 1: float, 2: float, 3: float} $requestedBBox
+ * @param array{0: float, 1: float, 2: float, 3: float} $normalizedBBox
+ * @param array{0: float, 1: float, 2: float, 3: float}|null $originalRequestedBBox
  * @return array{
  *   response_body: string,
  *   content_type: string,
  *   status_code: int,
  *   match_type: string,
- *   normalized_bbox: string
+ *   normalized_bbox: string,
+ *   subset_source_elements?: int,
+ *   subset_returned_elements?: int,
+ *   subset_selected_ways?: int,
+ *   subset_selected_relations?: int
  * }|null
  */
 function findCache(
     PDO $pdo,
     string $cacheKey,
     string $queryHash,
-    array $requestedBBox,
-    bool $allowContainingMatch = false
+    array $normalizedBBox,
+    bool $allowContainingMatch = false,
+    ?array $originalRequestedBBox = null,
+    bool $allowSubsetMatch = true
 ): ?array
 {
     $exact = findExactCache($pdo, $cacheKey);
@@ -830,11 +847,36 @@ function findCache(
         return $exact;
     }
 
+    // A containing source cache is tested against the original requested bbox,
+    // not the padded/grid-normalized bbox. This lets the existing cache margin
+    // absorb small pans without forcing another upstream request.
+    if ($allowSubsetMatch && $originalRequestedBBox !== null) {
+        $candidate = findContainingCache($pdo, $queryHash, $originalRequestedBBox);
+        if ($candidate !== null) {
+            $subset = ProxySubsetCache::extract(
+                $candidate['response_body'],
+                $originalRequestedBBox
+            );
+
+            if ($subset !== null) {
+                $candidate['response_body'] = $subset['body'];
+                $candidate['match_type'] = 'subset';
+                $candidate['subset_source_elements'] = $subset['source_elements'];
+                $candidate['subset_returned_elements'] = $subset['returned_elements'];
+                $candidate['subset_selected_ways'] = $subset['selected_ways'];
+                $candidate['subset_selected_relations'] = $subset['selected_relations'];
+                return $candidate;
+            }
+        }
+    }
+
+    // Legacy behavior remains available as an explicit opt-in. Unlike subset
+    // matching, it returns the containing cache body unchanged.
     if (!$allowContainingMatch) {
         return null;
     }
 
-    return findContainingCache($pdo, $queryHash, $requestedBBox);
+    return findContainingCache($pdo, $queryHash, $normalizedBBox);
 }
 
 /**
