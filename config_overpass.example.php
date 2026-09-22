@@ -111,7 +111,9 @@ return [
         ['max_span' => 10.0, 'step' => 1.00],
     ],
 
-    // グリッド化後は完全一致キャッシュを優先し、さらに大きなbboxの本文は流用しない。
+    // true: 完全一致がMISSのとき、同じクエリで要求bboxを含む有効なキャッシュを探す。
+    // 複数ある場合は最小面積のものを使い、本文は要求bboxへ切り出さずそのまま返すため、
+    // 要求範囲外の要素が含まれることがある。falseなら完全一致のみ使い、MISS後は上流から取得する。
     'allow_containing_cache_match' => false,
 
     // raw_bbox_grid_enabled=false の場合に、data=... を完全passthroughするか。
@@ -143,6 +145,14 @@ return [
     // 何回に1回、期限切れキャッシュ削除を試すか。200なら約0.5%。
     'cleanup_probability_denominator' => 200,
 
+    // 新規キャッシュ本文を、MySQLではなくgzipファイルへ保存する。
+    // 既存のDB内LONGBLOBキャッシュは、そのまま読める。
+    'cache_file_storage_enabled' => true,
+
+    // Web公開ディレクトリの外にある絶対パスを指定する。
+    // 未指定時も同じ runtime/cache-bodies が使われる。
+    'cache_storage_dir' => __DIR__ . '/runtime/cache-bodies',
+
     // DBへ保存する本文サイズ上限（バイト）。これを超える応答は返すがキャッシュしない。
     'max_cache_body_bytes' => 8 * 1024 * 1024,
     'php_memory_limit' => '512M',
@@ -153,7 +163,8 @@ return [
     // 共有サーバーでは大きくしすぎない。
     'max_response_body_memory_bytes' => 8 * 1024 * 1024,
 
-    // DB保存時にgzip圧縮するか
+    // cache_file_storage_enabled=false でDB保存へ戻した場合にgzip圧縮するか。
+    // ファイル保存時は常にgzipになる。
     'compress_cache' => true,
 
     'stream_raw_data_passthrough' => true,

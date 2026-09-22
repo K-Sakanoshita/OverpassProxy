@@ -51,6 +51,12 @@ function cache_admin_fatal_handler()
 
 register_shutdown_function('cache_admin_fatal_handler');
 
+$cacheFileStorePath = __DIR__ . '/lib/CacheFileStore.php';
+if (!is_file($cacheFileStorePath)) {
+    json_error(500, 'Cache file storage module is not available', array());
+}
+require_once $cacheFileStorePath;
+
 function json_response($data)
 {
     if (!headers_sent()) {
@@ -228,6 +234,7 @@ function handle_request()
 {
     $config = load_config();
     require_admin_auth($config);
+    $cacheFileStore = ProxyCacheFileStore::fromConfig($config);
 
     $method = get_method();
 
@@ -253,6 +260,7 @@ function handle_request()
                 'pdo_loaded' => class_exists('PDO'),
                 'pdo_mysql_loaded' => extension_loaded('pdo_mysql'),
                 'zlib_loaded' => extension_loaded('zlib'),
+                'cache_file_writes_enabled' => $cacheFileStore->isWriteEnabled(),
             ));
         }
 
@@ -273,7 +281,7 @@ function handle_request()
         }
 
         if ($action === 'download') {
-            download_caches($pdo, $_GET);
+            download_caches($pdo, $_GET, $cacheFileStore);
         }
 
         json_error(400, 'Unknown action', array('action' => $action));
@@ -305,14 +313,14 @@ function handle_request()
 
             json_response(array(
                 'ok' => true,
-                'deleted' => delete_caches($pdo, $keys),
+                'deleted' => delete_caches($pdo, $keys, $cacheFileStore),
             ));
         }
 
         if ($action === 'delete_expired') {
             json_response(array(
                 'ok' => true,
-                'deleted' => delete_expired_caches($pdo),
+                'deleted' => delete_expired_caches($pdo, $cacheFileStore),
             ));
         }
 
@@ -329,7 +337,7 @@ function handle_request()
 
             json_response(array(
                 'ok' => true,
-                'deleted' => delete_caches_older_than_days($pdo, $days),
+                'deleted' => delete_caches_older_than_days($pdo, $days, $cacheFileStore),
                 'days' => $days,
             ));
         }
@@ -388,7 +396,11 @@ function list_caches($pdo, $query)
                 bbox_area,
                 content_type,
                 status_code,
-                OCTET_LENGTH(response_body) AS stored_bytes,
+                COALESCE(stored_bytes, OCTET_LENGTH(response_body), 0) AS stored_bytes,
+                CASE
+                    WHEN response_file IS NOT NULL AND response_file <> "" THEN "file"
+                    ELSE "database"
+                END AS storage_type,
                 body_encoding,
                 DATE_FORMAT(created_at, "%Y-%m-%dT%H:%i:%sZ") AS created_at_utc,
                 DATE_FORMAT(expires_at, "%Y-%m-%dT%H:%i:%sZ") AS expires_at_utc,
@@ -423,6 +435,7 @@ function list_caches($pdo, $query)
             'content_type' => (string)$row['content_type'],
             'status_code' => (int)$row['status_code'],
             'stored_bytes' => (int)$row['stored_bytes'],
+            'storage_type' => (string)$row['storage_type'],
             'body_encoding' => (string)$row['body_encoding'],
             'created_at_utc' => (string)$row['created_at_utc'],
             'expires_at_utc' => (string)$row['expires_at_utc'],
@@ -439,7 +452,9 @@ function get_summary($pdo)
                 COUNT(*) AS total_count,
                 SUM(expires_at > UTC_TIMESTAMP()) AS active_count,
                 SUM(expires_at <= UTC_TIMESTAMP()) AS expired_count,
-                COALESCE(SUM(OCTET_LENGTH(response_body)), 0) AS total_bytes
+                COALESCE(SUM(COALESCE(stored_bytes, OCTET_LENGTH(response_body), 0)), 0) AS total_bytes,
+                SUM(response_file IS NOT NULL AND response_file <> "") AS file_count,
+                SUM(response_file IS NULL OR response_file = "") AS database_count
             FROM overpass_cache';
 
     $row = $pdo->query($sql)->fetch();
@@ -449,10 +464,12 @@ function get_summary($pdo)
         'active_count' => isset($row['active_count']) ? (int)$row['active_count'] : 0,
         'expired_count' => isset($row['expired_count']) ? (int)$row['expired_count'] : 0,
         'total_bytes' => isset($row['total_bytes']) ? (int)$row['total_bytes'] : 0,
+        'file_count' => isset($row['file_count']) ? (int)$row['file_count'] : 0,
+        'database_count' => isset($row['database_count']) ? (int)$row['database_count'] : 0,
     );
 }
 
-function download_caches($pdo, $query)
+function download_caches($pdo, $query, $cacheFileStore)
 {
     $keys = parse_cache_keys_for_download($query);
 
@@ -467,7 +484,7 @@ function download_caches($pdo, $query)
 
     if (count($keys) === 1 && count($items) === 1) {
         $item = $items[0];
-        $body = decode_cache_body((string)$item['response_body'], (string)$item['body_encoding']);
+        $body = read_cache_body($item, $cacheFileStore);
         if ($body === null) {
             json_error(500, 'Failed to decode cache body', array());
         }
@@ -481,7 +498,7 @@ function download_caches($pdo, $query)
 
     $exportItems = array();
     foreach ($items as $item) {
-        $body = decode_cache_body((string)$item['response_body'], (string)$item['body_encoding']);
+        $body = read_cache_body($item, $cacheFileStore);
         if ($body === null) {
             $body = '';
         }
@@ -573,6 +590,9 @@ function read_caches_for_download($pdo, $keys)
                 query_hash,
                 normalized_bbox,
                 response_body,
+                response_file,
+                stored_bytes,
+                response_sha256,
                 body_encoding,
                 content_type,
                 status_code,
@@ -598,6 +618,36 @@ function read_caches_for_download($pdo, $keys)
     }
 
     return $ordered;
+}
+
+function read_cache_body($item, $cacheFileStore)
+{
+    $responseFile = isset($item['response_file']) ? trim((string)$item['response_file']) : '';
+    if ($responseFile !== '') {
+        $storedBody = $cacheFileStore->read($responseFile);
+        if (!is_string($storedBody)) {
+            return null;
+        }
+
+        $expectedBytes = isset($item['stored_bytes']) ? (int)$item['stored_bytes'] : 0;
+        if ($expectedBytes > 0 && strlen($storedBody) !== $expectedBytes) {
+            return null;
+        }
+
+        $expectedHash = isset($item['response_sha256'])
+            ? strtolower(trim((string)$item['response_sha256']))
+            : '';
+        if ($expectedHash !== '' && !safe_hash_equals($expectedHash, hash('sha256', $storedBody))) {
+            return null;
+        }
+    } else {
+        if (!array_key_exists('response_body', $item) || $item['response_body'] === null) {
+            return null;
+        }
+        $storedBody = (string)$item['response_body'];
+    }
+
+    return decode_cache_body($storedBody, (string)$item['body_encoding']);
 }
 
 function decode_cache_body($body, $encoding)
@@ -639,7 +689,7 @@ function make_single_cache_download_filename($item)
     return 'overpass_cache_' . gmdate('Ymd_His') . 'Z_' . $key . '.' . $ext;
 }
 
-function delete_caches($pdo, $keys)
+function delete_caches($pdo, $keys, $cacheFileStore)
 {
     $clean = array();
     foreach ($keys as $v) {
@@ -657,25 +707,111 @@ function delete_caches($pdo, $keys)
     }
 
     $placeholders = implode(',', array_fill(0, count($clean), '?'));
-    $stmt = $pdo->prepare('DELETE FROM overpass_cache WHERE cache_key IN (' . $placeholders . ')');
-    $stmt->execute($clean);
-    return $stmt->rowCount();
+    return delete_cache_rows_in_batches(
+        $pdo,
+        'cache_key IN (' . $placeholders . ')',
+        $clean,
+        $cacheFileStore
+    );
 }
 
-function delete_expired_caches($pdo)
+function delete_expired_caches($pdo, $cacheFileStore)
 {
-    $stmt = $pdo->prepare('DELETE FROM overpass_cache WHERE expires_at <= UTC_TIMESTAMP()');
-    $stmt->execute();
-    return $stmt->rowCount();
+    return delete_cache_rows_in_batches(
+        $pdo,
+        'expires_at <= UTC_TIMESTAMP()',
+        array(),
+        $cacheFileStore
+    );
 }
 
-function delete_caches_older_than_days($pdo, $days)
+function delete_caches_older_than_days($pdo, $days, $cacheFileStore)
 {
     $days = (int)$days;
-    $sql = 'DELETE FROM overpass_cache WHERE created_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ' . $days . ' DAY)';
-    $stmt = $pdo->prepare($sql);
-    $stmt->execute();
-    return $stmt->rowCount();
+    return delete_cache_rows_in_batches(
+        $pdo,
+        'created_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ' . $days . ' DAY)',
+        array(),
+        $cacheFileStore
+    );
+}
+
+function delete_cache_rows_in_batches($pdo, $whereSql, $params, $cacheFileStore)
+{
+    $totalDeleted = 0;
+    $batchSize = 500;
+
+    while (true) {
+        $rows = array();
+        try {
+            $pdo->beginTransaction();
+            $select = $pdo->prepare(
+                'SELECT cache_key, response_file
+                 FROM overpass_cache
+                 WHERE ' . $whereSql . '
+                 ORDER BY cache_key
+                 LIMIT ' . $batchSize . '
+                 FOR UPDATE'
+            );
+            $select->execute($params);
+            $rows = $select->fetchAll();
+
+            if (count($rows) === 0) {
+                $pdo->commit();
+                break;
+            }
+
+            $keys = array();
+            foreach ($rows as $row) {
+                $keys[] = (string)$row['cache_key'];
+            }
+
+            $placeholders = implode(',', array_fill(0, count($keys), '?'));
+            $delete = $pdo->prepare(
+                'DELETE FROM overpass_cache WHERE cache_key IN (' . $placeholders . ')'
+            );
+            $delete->execute($keys);
+            $deletedThisBatch = $delete->rowCount();
+            $pdo->commit();
+            $totalDeleted += $deletedThisBatch;
+        } catch (Exception $e) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            throw $e;
+        }
+
+        foreach ($rows as $row) {
+            $responseFile = isset($row['response_file'])
+                ? trim((string)$row['response_file'])
+                : '';
+            if ($responseFile === '') {
+                continue;
+            }
+
+            try {
+                if (!$cacheFileStore->delete($responseFile)) {
+                    error_log('Failed to delete cache file for key ' . (string)$row['cache_key']);
+                }
+            } catch (Exception $e) {
+                error_log(
+                    'Cache file delete error for key ' . (string)$row['cache_key'] . ': ' . $e->getMessage()
+                );
+            }
+        }
+
+        if (count($rows) < $batchSize) {
+            break;
+        }
+    }
+
+    try {
+        $cacheFileStore->cleanupTrash(500);
+    } catch (Exception $e) {
+        error_log('Cache trash cleanup error: ' . $e->getMessage());
+    }
+
+    return $totalDeleted;
 }
 
 function parse_optional_bbox($query)

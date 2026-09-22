@@ -50,6 +50,7 @@ $supportPaths = [
     __DIR__ . '/lib/BboxGrid.php',
     __DIR__ . '/lib/RawQueryBbox.php',
     __DIR__ . '/lib/SubsetCache.php',
+    __DIR__ . '/lib/CacheFileStore.php',
 ];
 foreach ($supportPaths as $supportPath) {
     if (!is_file($supportPath)) {
@@ -60,6 +61,8 @@ foreach ($supportPaths as $supportPath) {
     }
     require_once $supportPath;
 }
+
+$cacheFileStore = ProxyCacheFileStore::fromConfig($config);
 
 applyRuntimeLimits($config);
 
@@ -210,7 +213,8 @@ try {
         $pdo = createPdo($config['db']);
         maybeCleanupExpiredCache(
             $pdo,
-            (int)($config['cleanup_probability_denominator'] ?? 200)
+            (int)($config['cleanup_probability_denominator'] ?? 200),
+            $cacheFileStore
         );
         $cached = findCache(
             $pdo,
@@ -219,7 +223,8 @@ try {
             $normalizedBBox,
             (bool)($config['allow_containing_cache_match'] ?? false),
             $bbox,
-            (bool)($config['subset_cache_enabled'] ?? true)
+            (bool)($config['subset_cache_enabled'] ?? true),
+            $cacheFileStore
         );
     } catch (PDOException $e) {
         error_log('Overpass proxy cache DB unavailable: ' . $e->getMessage());
@@ -309,7 +314,10 @@ try {
 
         if ($cacheDecision['cacheable']) {
             $rawBodyBytes = strlen($rawBodyForCache);
-            $compressCache = (bool)($config['compress_cache'] ?? true);
+            // File-backed cache bodies are always gzip-compressed. The legacy
+            // DB-backed path retains compress_cache for rollback compatibility.
+            $compressCache = $cacheFileStore->isWriteEnabled()
+                || (bool)($config['compress_cache'] ?? true);
 
             if ($rawBodyBytes <= $maxCacheBodyBytes) {
                 $bodyEncoding = $compressCache ? 'gzip' : 'plain';
@@ -328,12 +336,13 @@ try {
                             $bodyEncoding,
                             $upstream['content_type'],
                             $upstream['status_code'],
-                            $ttl
+                            $ttl,
+                            $cacheFileStore
                         );
                         $cacheSkipReason = '';
-                    } catch (PDOException $e) {
+                    } catch (Throwable $e) {
                         error_log('Overpass proxy cache save failed: ' . $e->getMessage());
-                        $cacheSkipReason = 'db_save_failed';
+                        $cacheSkipReason = 'cache_save_failed';
                     }
                 } else {
                     $cacheSkipReason = 'compressed_body_too_large';
@@ -837,12 +846,13 @@ function findCache(
     string $cacheKey,
     string $queryHash,
     array $normalizedBBox,
-    bool $allowContainingMatch = false,
-    ?array $originalRequestedBBox = null,
-    bool $allowSubsetMatch = true
+    bool $allowContainingMatch,
+    ?array $originalRequestedBBox,
+    bool $allowSubsetMatch,
+    ProxyCacheFileStore $cacheFileStore
 ): ?array
 {
-    $exact = findExactCache($pdo, $cacheKey);
+    $exact = findExactCache($pdo, $cacheKey, $cacheFileStore);
     if ($exact !== null) {
         return $exact;
     }
@@ -851,7 +861,12 @@ function findCache(
     // not the padded/grid-normalized bbox. This lets the existing cache margin
     // absorb small pans without forcing another upstream request.
     if ($allowSubsetMatch && $originalRequestedBBox !== null) {
-        $candidate = findContainingCache($pdo, $queryHash, $originalRequestedBBox);
+        $candidate = findContainingCache(
+            $pdo,
+            $queryHash,
+            $originalRequestedBBox,
+            $cacheFileStore
+        );
         if ($candidate !== null) {
             $subset = ProxySubsetCache::extract(
                 $candidate['response_body'],
@@ -876,7 +891,7 @@ function findCache(
         return null;
     }
 
-    return findContainingCache($pdo, $queryHash, $normalizedBBox);
+    return findContainingCache($pdo, $queryHash, $normalizedBBox, $cacheFileStore);
 }
 
 /**
@@ -888,9 +903,14 @@ function findCache(
  *   normalized_bbox: string
  * }|null
  */
-function findExactCache(PDO $pdo, string $cacheKey): ?array
+function findExactCache(
+    PDO $pdo,
+    string $cacheKey,
+    ProxyCacheFileStore $cacheFileStore
+): ?array
 {
-    $sql = 'SELECT cache_key, normalized_bbox, response_body, body_encoding, content_type, status_code
+    $sql = 'SELECT cache_key, normalized_bbox, response_body, response_file,
+                   stored_bytes, response_sha256, body_encoding, content_type, status_code
             FROM overpass_cache
             WHERE cache_key = :cache_key
               AND expires_at > UTC_TIMESTAMP()
@@ -906,9 +926,14 @@ function findExactCache(PDO $pdo, string $cacheKey): ?array
         return null;
     }
 
-    $body = decodeCacheBody((string)$row['response_body'], (string)$row['body_encoding']);
+    $body = readCachedResponseBody($row, $cacheFileStore);
     if ($body === null) {
-        deleteCacheByKey($pdo, (string)$row['cache_key']);
+        deleteCacheByKey(
+            $pdo,
+            (string)$row['cache_key'],
+            (string)($row['response_file'] ?? ''),
+            $cacheFileStore
+        );
         return null;
     }
 
@@ -918,7 +943,12 @@ function findExactCache(PDO $pdo, string $cacheKey): ?array
         'body' => $body,
     ]);
     if (!$cacheValidation['cacheable']) {
-        deleteCacheByKey($pdo, (string)$row['cache_key']);
+        deleteCacheByKey(
+            $pdo,
+            (string)$row['cache_key'],
+            (string)($row['response_file'] ?? ''),
+            $cacheFileStore
+        );
         return null;
     }
 
@@ -941,11 +971,17 @@ function findExactCache(PDO $pdo, string $cacheKey): ?array
  *   normalized_bbox: string
  * }|null
  */
-function findContainingCache(PDO $pdo, string $queryHash, array $requestedBBox): ?array
+function findContainingCache(
+    PDO $pdo,
+    string $queryHash,
+    array $requestedBBox,
+    ProxyCacheFileStore $cacheFileStore
+): ?array
 {
     [$south, $west, $north, $east] = $requestedBBox;
 
-    $sql = 'SELECT cache_key, normalized_bbox, response_body, body_encoding, content_type, status_code
+    $sql = 'SELECT cache_key, normalized_bbox, response_body, response_file,
+                   stored_bytes, response_sha256, body_encoding, content_type, status_code
             FROM overpass_cache
             WHERE query_hash = :query_hash
               AND expires_at > UTC_TIMESTAMP()
@@ -969,9 +1005,14 @@ function findContainingCache(PDO $pdo, string $queryHash, array $requestedBBox):
         return null;
     }
 
-    $body = decodeCacheBody((string)$row['response_body'], (string)$row['body_encoding']);
+    $body = readCachedResponseBody($row, $cacheFileStore);
     if ($body === null) {
-        deleteCacheByKey($pdo, (string)$row['cache_key']);
+        deleteCacheByKey(
+            $pdo,
+            (string)$row['cache_key'],
+            (string)($row['response_file'] ?? ''),
+            $cacheFileStore
+        );
         return null;
     }
 
@@ -981,7 +1022,12 @@ function findContainingCache(PDO $pdo, string $queryHash, array $requestedBBox):
         'body' => $body,
     ]);
     if (!$cacheValidation['cacheable']) {
-        deleteCacheByKey($pdo, (string)$row['cache_key']);
+        deleteCacheByKey(
+            $pdo,
+            (string)$row['cache_key'],
+            (string)($row['response_file'] ?? ''),
+            $cacheFileStore
+        );
         return null;
     }
 
@@ -994,16 +1040,76 @@ function findContainingCache(PDO $pdo, string $queryHash, array $requestedBBox):
     ];
 }
 
-function deleteCacheByKey(PDO $pdo, string $cacheKey): void
+/** @param array<string, mixed> $row */
+function readCachedResponseBody(array $row, ProxyCacheFileStore $cacheFileStore): ?string
+{
+    $responseFile = trim((string)($row['response_file'] ?? ''));
+    if ($responseFile !== '') {
+        $storedBody = $cacheFileStore->read($responseFile);
+        if ($storedBody === null) {
+            return null;
+        }
+
+        $expectedBytes = (int)($row['stored_bytes'] ?? 0);
+        if ($expectedBytes > 0 && strlen($storedBody) !== $expectedBytes) {
+            return null;
+        }
+
+        $expectedHash = strtolower(trim((string)($row['response_sha256'] ?? '')));
+        if ($expectedHash !== '' && !hash_equals($expectedHash, hash('sha256', $storedBody))) {
+            return null;
+        }
+    } else {
+        if (!array_key_exists('response_body', $row) || $row['response_body'] === null) {
+            return null;
+        }
+        $storedBody = (string)$row['response_body'];
+    }
+
+    return decodeCacheBody($storedBody, (string)$row['body_encoding']);
+}
+
+function deleteCacheByKey(
+    PDO $pdo,
+    string $cacheKey,
+    string $responseFile,
+    ProxyCacheFileStore $cacheFileStore
+): void
 {
     if ($cacheKey === '') {
         return;
     }
 
-    $stmt = $pdo->prepare('DELETE FROM overpass_cache WHERE cache_key = :cache_key LIMIT 1');
-    $stmt->execute([
-        ':cache_key' => $cacheKey,
-    ]);
+    if ($responseFile !== '') {
+        $stmt = $pdo->prepare(
+            'DELETE FROM overpass_cache
+             WHERE cache_key = :cache_key AND response_file = :response_file
+             LIMIT 1'
+        );
+        $stmt->execute([
+            ':cache_key' => $cacheKey,
+            ':response_file' => $responseFile,
+        ]);
+    } else {
+        $stmt = $pdo->prepare(
+            'DELETE FROM overpass_cache
+             WHERE cache_key = :cache_key AND response_file IS NULL
+             LIMIT 1'
+        );
+        $stmt->execute([
+            ':cache_key' => $cacheKey,
+        ]);
+    }
+
+    if ($stmt->rowCount() > 0 && $responseFile !== '') {
+        try {
+            if (!$cacheFileStore->delete($responseFile)) {
+                error_log('Failed to delete cache file for key ' . $cacheKey);
+            }
+        } catch (Throwable $e) {
+            error_log('Cache file delete error for key ' . $cacheKey . ': ' . $e->getMessage());
+        }
+    }
 }
 
 /**
@@ -1019,10 +1125,30 @@ function saveCache(
     string $bodyEncoding,
     string $contentType,
     int $statusCode,
-    int $ttlSeconds
+    int $ttlSeconds,
+    ProxyCacheFileStore $cacheFileStore
 ): void {
     [$south, $west, $north, $east] = $normalizedBBox;
     $bboxArea = calcBboxArea($normalizedBBox);
+
+    $responseBodyForDb = $responseBody;
+    $responseFile = null;
+    $storedBytes = strlen($responseBody);
+    $responseSha256 = hash('sha256', $responseBody);
+
+    if ($cacheFileStore->isWriteEnabled()) {
+        if ($bodyEncoding !== 'gzip') {
+            throw new RuntimeException('File-backed cache body must use gzip encoding');
+        }
+
+        $fileMetadata = $cacheFileStore->writeGzip($cacheKey, $responseBody);
+        $responseBodyForDb = null;
+        $responseFile = $fileMetadata['relative_path'];
+        $storedBytes = $fileMetadata['stored_bytes'];
+        $responseSha256 = $fileMetadata['sha256'];
+    }
+
+    $oldResponseFile = null;
 
     $sql = 'INSERT INTO overpass_cache
             (
@@ -1035,6 +1161,9 @@ function saveCache(
               normalized_east,
               bbox_area,
               response_body,
+              response_file,
+              stored_bytes,
+              response_sha256,
               body_encoding,
               content_type,
               status_code,
@@ -1052,6 +1181,9 @@ function saveCache(
               :normalized_east,
               :bbox_area,
               :response_body,
+              :response_file,
+              :stored_bytes,
+              :response_sha256,
               :body_encoding,
               :content_type,
               :status_code,
@@ -1067,27 +1199,77 @@ function saveCache(
               normalized_east = VALUES(normalized_east),
               bbox_area = VALUES(bbox_area),
               response_body = VALUES(response_body),
+              response_file = VALUES(response_file),
+              stored_bytes = VALUES(stored_bytes),
+              response_sha256 = VALUES(response_sha256),
               body_encoding = VALUES(body_encoding),
               content_type = VALUES(content_type),
               status_code = VALUES(status_code),
               created_at = UTC_TIMESTAMP(),
               expires_at = DATE_ADD(UTC_TIMESTAMP(), INTERVAL :ttl_seconds SECOND)';
 
-    $stmt = $pdo->prepare($sql);
-    $stmt->bindValue(':cache_key', $cacheKey, PDO::PARAM_STR);
-    $stmt->bindValue(':query_hash', $queryHash, PDO::PARAM_STR);
-    $stmt->bindValue(':normalized_bbox', $normalizedBBoxText, PDO::PARAM_STR);
-    $stmt->bindValue(':normalized_south', $south);
-    $stmt->bindValue(':normalized_west', $west);
-    $stmt->bindValue(':normalized_north', $north);
-    $stmt->bindValue(':normalized_east', $east);
-    $stmt->bindValue(':bbox_area', $bboxArea);
-    $stmt->bindValue(':response_body', $responseBody, PDO::PARAM_LOB);
-    $stmt->bindValue(':body_encoding', $bodyEncoding, PDO::PARAM_STR);
-    $stmt->bindValue(':content_type', $contentType, PDO::PARAM_STR);
-    $stmt->bindValue(':status_code', $statusCode, PDO::PARAM_INT);
-    $stmt->bindValue(':ttl_seconds', $ttlSeconds, PDO::PARAM_INT);
-    $stmt->execute();
+    try {
+        $pdo->beginTransaction();
+
+        $oldStmt = $pdo->prepare(
+            'SELECT response_file FROM overpass_cache WHERE cache_key = :cache_key FOR UPDATE'
+        );
+        $oldStmt->execute([':cache_key' => $cacheKey]);
+        $oldRow = $oldStmt->fetch();
+        if ($oldRow && trim((string)($oldRow['response_file'] ?? '')) !== '') {
+            $oldResponseFile = (string)$oldRow['response_file'];
+        }
+
+        $stmt = $pdo->prepare($sql);
+        $stmt->bindValue(':cache_key', $cacheKey, PDO::PARAM_STR);
+        $stmt->bindValue(':query_hash', $queryHash, PDO::PARAM_STR);
+        $stmt->bindValue(':normalized_bbox', $normalizedBBoxText, PDO::PARAM_STR);
+        $stmt->bindValue(':normalized_south', $south);
+        $stmt->bindValue(':normalized_west', $west);
+        $stmt->bindValue(':normalized_north', $north);
+        $stmt->bindValue(':normalized_east', $east);
+        $stmt->bindValue(':bbox_area', $bboxArea);
+        $stmt->bindValue(
+            ':response_body',
+            $responseBodyForDb,
+            $responseBodyForDb === null ? PDO::PARAM_NULL : PDO::PARAM_LOB
+        );
+        $stmt->bindValue(
+            ':response_file',
+            $responseFile,
+            $responseFile === null ? PDO::PARAM_NULL : PDO::PARAM_STR
+        );
+        $stmt->bindValue(':stored_bytes', $storedBytes, PDO::PARAM_INT);
+        $stmt->bindValue(':response_sha256', $responseSha256, PDO::PARAM_STR);
+        $stmt->bindValue(':body_encoding', $bodyEncoding, PDO::PARAM_STR);
+        $stmt->bindValue(':content_type', $contentType, PDO::PARAM_STR);
+        $stmt->bindValue(':status_code', $statusCode, PDO::PARAM_INT);
+        $stmt->bindValue(':ttl_seconds', $ttlSeconds, PDO::PARAM_INT);
+        $stmt->execute();
+        $pdo->commit();
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        if ($responseFile !== null) {
+            try {
+                $cacheFileStore->delete($responseFile);
+            } catch (Throwable $cleanupError) {
+                error_log('Failed to clean up uncommitted cache file: ' . $cleanupError->getMessage());
+            }
+        }
+        throw $e;
+    }
+
+    if ($oldResponseFile !== null && $oldResponseFile !== $responseFile) {
+        try {
+            if (!$cacheFileStore->delete($oldResponseFile)) {
+                error_log('Failed to delete replaced cache file for key ' . $cacheKey);
+            }
+        } catch (Throwable $e) {
+            error_log('Replaced cache file delete error for key ' . $cacheKey . ': ' . $e->getMessage());
+        }
+    }
 }
 
 /**
@@ -1204,7 +1386,11 @@ function formatFloatHeader(float $value): string
     return rtrim(rtrim(sprintf('%.12F', $value), '0'), '.');
 }
 
-function maybeCleanupExpiredCache(PDO $pdo, int $denominator): void
+function maybeCleanupExpiredCache(
+    PDO $pdo,
+    int $denominator,
+    ProxyCacheFileStore $cacheFileStore
+): void
 {
     if ($denominator < 1) {
         return;
@@ -1214,12 +1400,64 @@ function maybeCleanupExpiredCache(PDO $pdo, int $denominator): void
         return;
     }
 
-    $sql = 'DELETE FROM overpass_cache
-            WHERE expires_at < UTC_TIMESTAMP()
-            LIMIT 100';
+    $rows = [];
+    try {
+        $pdo->beginTransaction();
+        $stmt = $pdo->prepare(
+            'SELECT cache_key, response_file
+             FROM overpass_cache
+             WHERE expires_at < UTC_TIMESTAMP()
+             ORDER BY expires_at ASC
+             LIMIT 100
+             FOR UPDATE'
+        );
+        $stmt->execute();
+        $rows = $stmt->fetchAll();
 
-    $stmt = $pdo->prepare($sql);
-    $stmt->execute();
+        if ($rows !== []) {
+            $keys = array_map(
+                static fn(array $row): string => (string)$row['cache_key'],
+                $rows
+            );
+            $placeholders = implode(',', array_fill(0, count($keys), '?'));
+            $deleteStmt = $pdo->prepare(
+                'DELETE FROM overpass_cache WHERE cache_key IN (' . $placeholders . ')'
+            );
+            $deleteStmt->execute($keys);
+        }
+
+        $pdo->commit();
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        throw $e;
+    }
+
+    foreach ($rows as $row) {
+        $responseFile = trim((string)($row['response_file'] ?? ''));
+        if ($responseFile === '') {
+            continue;
+        }
+
+        try {
+            if (!$cacheFileStore->delete($responseFile)) {
+                error_log('Failed to delete expired cache file for key ' . (string)$row['cache_key']);
+            }
+        } catch (Throwable $e) {
+            error_log(
+                'Expired cache file delete error for key '
+                . (string)$row['cache_key']
+                . ': '
+                . $e->getMessage()
+            );
+        }
+    }
+    try {
+        $cacheFileStore->cleanupTrash(100);
+    } catch (Throwable $e) {
+        error_log('Cache trash cleanup error: ' . $e->getMessage());
+    }
 }
 
 function validateOverpassQueryPreflight(string $query): ?string

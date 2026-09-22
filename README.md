@@ -90,13 +90,40 @@ bboxを抽出できないraw Overpass QLはキャッシュ対象外となり、D
 
 ## データベース
 
-新規環境では `database/schema.sql` を適用してください。既存環境ではカラム型とインデックスを比較し、バックアップ取得後に不足分だけを反映してください。
+新規環境では `database/schema.sql` を適用してください。
+
+既存環境へファイルキャッシュを導入する場合は、DBをバックアップしてから、コードを配置する前に次を1回だけ適用します。
+
+```sh
+mysql -u USER -p DATABASE < database/migrate_cache_files.sql
+```
+
+このマイグレーションは既存の`response_body`を削除しません。既存行はDB本文から読み取り、新しく作成・更新される行だけがファイル保存へ切り替わります。既存行は期限切れまたは同一キーの更新時に自然に減ります。
+
+## gzipファイルキャッシュ
+
+`cache_file_storage_enabled=true`では、OverpassのJSON本文をgzip圧縮し、Web公開ディレクトリ外の`cache_storage_dir`へ保存します。MySQLにはBBOX、期限、相対ファイル名、圧縮サイズ、SHA-256などのメタデータだけを保存します。
+
+```php
+'cache_file_storage_enabled' => true,
+'cache_storage_dir' => __DIR__ . '/runtime/cache-bodies',
+```
+
+保存先は必ず絶対パスで指定します。ファイル名は利用者入力ではなくキャッシュキーとランダムな世代IDから生成され、`aa/bb/...json.gz`のように分散配置されます。一時ファイルへの書き込み後に`rename`するため、書き込み途中の本文は公開されません。
+
+- ファイルが存在しない、サイズ・SHA-256が一致しない、gzip展開に失敗する場合、そのDB行を削除してMISSとして上流から再取得します。
+- 期限切れ、管理画面の個別削除、日数指定削除では、DB行と対応ファイルを同じ削除処理で除去します。
+- `cache_file_storage_enabled=false`に戻すと、新規本文は従来どおりDBへ保存されます。すでに存在するファイルキャッシュは引き続き読み取れます。
+- 管理画面では`file`と`database`の件数・保存先を確認でき、どちらも同じ操作でダウンロード・削除できます。
+
+低アクセス環境では確率的な期限切れ清掃だけでは削除が遅れるため、管理画面の「期限切れ削除」も定期的に実行してください。
 
 ## ローカル確認
 
 ```sh
 php tests/bbox_grid_test.php
 php tests/request_guard_test.php
+php tests/cache_file_store_test.php
 find . -name '*.php' -type f -exec php -l {} \;
 ```
 
@@ -107,3 +134,5 @@ CLI環境で上流転送まで確認するにはPHP cURL拡張が必要です。
 - ディレクトリ: `755`
 - 公開PHP・`.htaccess`・ドキュメント: `644`
 - `config_overpass.php`: 所有者だけが読む場合は`600`、Webサーバーグループにも読ませる場合は`640`
+- `cache_storage_dir`: Webサーバープロセスだけが読み書きする場合は`700`
+- gzipキャッシュファイル: 実装が`600`を設定

@@ -339,7 +339,8 @@ function getBasicAuthCredentials(): array
 
                 const s = data.summary;
                 summaryEl.innerHTML =
-                    `総数 ${s.total_count} 件 / 有効 ${s.active_count} 件 / 期限切れ ${s.expired_count} 件 / 保存サイズ ${formatBytes(s.total_bytes)}`;
+                    `総数 ${s.total_count} 件 / 有効 ${s.active_count} 件 / 期限切れ ${s.expired_count} 件 / 保存サイズ ${formatBytes(s.total_bytes)}` +
+                    ` / ファイル ${s.file_count} 件 / DB本文 ${s.database_count} 件`;
             } catch (err) {
                 console.error(err);
                 summaryEl.textContent = '集計読込失敗: ' + getErrorMessage(err);
@@ -424,7 +425,7 @@ function getBasicAuthCredentials(): array
                 tr.innerHTML = `
             <td>
                 <span class="badge ${item.is_active ? 'active' : 'expired'}">${item.is_active ? '有効' : '期限切れ'}</span>
-                <div class="small">${escapeHtml(item.status_code + ' / ' + item.body_encoding)}</div>
+                <div class="small">${escapeHtml(item.status_code + ' / ' + item.body_encoding + ' / ' + item.storage_type)}</div>
             </td>
             <td>
                 <div>${escapeHtml(item.normalized_bbox)}</div>
